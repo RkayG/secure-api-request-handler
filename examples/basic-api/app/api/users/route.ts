@@ -2,9 +2,10 @@
  * Basic API Example - User Management
  *
  * This example demonstrates basic CRUD operations with authentication,
- * validation, and sanitization.
+ * validation, and sanitization using Express + Prisma.
  */
 
+import { Router } from 'express';
 import { z } from 'zod';
 import {
   createHandler,
@@ -12,17 +13,19 @@ import {
   createAdminHandler
 } from '../../../../src';
 
+const router = Router();
+
 // Validation schemas
 const CreateUserSchema = z.object({
   email: z.string().email(),
   name: z.string().min(1).max(100),
-  role: z.enum(['user', 'admin']).default('user'),
+  role: z.enum(['USER', 'ADMIN']).default('USER'),
 });
 
 const UpdateUserSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   email: z.string().email().optional(),
-  role: z.enum(['user', 'admin']).optional(),
+  role: z.enum(['USER', 'ADMIN']).optional(),
 });
 
 // ============================================
@@ -32,7 +35,7 @@ const UpdateUserSchema = z.object({
 /**
  * GET /api/users - List users (public, but filtered)
  */
-export const GET = createHandler({
+router.get('/', createHandler({
   schema: z.object({
     limit: z.number().min(1).max(100).default(10),
     offset: z.number().min(0).default(0),
@@ -41,37 +44,49 @@ export const GET = createHandler({
   cache: {
     ttl: 300, // 5 minutes
     keyGenerator: (req) => {
-      const searchParams = req.nextUrl.searchParams;
-      return `users:list:${searchParams.get('limit')}:${searchParams.get('offset')}:${searchParams.get('search') || ''}`;
+      const query = req.query;
+      return `users:list:${query.limit}:${query.offset}:${query.search || ''}`;
     },
   },
-  handler: async ({ input, supabase }) => {
+  handler: async ({ input, prisma }) => {
     const { limit, offset, search } = input;
 
-    let query = supabase
-      .from('users')
-      .select('id, name, email, role, created_at')
-      .range(offset, offset + limit - 1);
-
+    const whereClause: any = {};
     if (search) {
-      query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%`);
+      whereClause.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { email: { contains: search, mode: 'insensitive' } },
+      ];
     }
 
-    const { data, error, count } = await query;
-
-    if (error) throw error;
+    const [users, total] = await Promise.all([
+      prisma.user.findMany({
+        where: whereClause,
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          role: true,
+          createdAt: true,
+        },
+        skip: offset,
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+      }),
+      prisma.user.count({ where: whereClause }),
+    ]);
 
     return {
-      users: data,
+      users,
       pagination: {
         limit,
         offset,
-        total: count,
-        hasMore: offset + limit < (count || 0),
+        total,
+        hasMore: offset + limit < total,
       },
     };
   },
-});
+}));
 
 // ============================================
 // Authenticated Routes
@@ -80,53 +95,54 @@ export const GET = createHandler({
 /**
  * POST /api/users - Create user (authenticated)
  */
-export const POST = createAuthenticatedHandler({
+router.post('/', createAuthenticatedHandler({
   schema: CreateUserSchema,
-  allowedRoles: ['admin'], // Only admins can create users
+  allowedRoles: ['ADMIN'], // Only admins can create users
   rateLimit: {
     windowMs: 60000, // 1 minute
     maxRequests: 10, // 10 user creations per minute
   },
-  handler: async ({ input, user, supabase }) => {
+  handler: async ({ input, user, prisma }) => {
     // Check if email already exists
-    const { data: existingUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', input.email)
-      .single();
+    const existingUser = await prisma.user.findUnique({
+      where: { email: input.email },
+    });
 
     if (existingUser) {
       throw new Error('User with this email already exists');
     }
 
-    const { data, error } = await supabase
-      .from('users')
-      .insert({
+    const newUser = await prisma.user.create({
+      data: {
         ...input,
-        created_by: user.id,
-      })
-      .select()
-      .single();
+        // Note: In real app, hash the password
+        password: 'hashed-password-placeholder',
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        createdAt: true,
+      },
+    });
 
-    if (error) throw error;
-
-    return data;
+    return newUser;
   },
-});
+}));
 
 // ============================================
-// User-Specific Routes (would be in [id]/route.ts)
+// User-Specific Routes
 // ============================================
 
 /**
- * Example: GET /api/users/[id] - Get user by ID
+ * GET /api/users/:id - Get user by ID
  */
-export const getUserById = createHandler({
-  requireAuth: true,
+router.get('/:id', createAuthenticatedHandler({
   requireOwnership: {
-    table: 'users',
+    model: 'User',
     resourceIdParam: 'id',
-    selectColumns: 'id, name, email, role, created_at',
+    selectFields: ['id', 'name', 'email', 'role', 'createdAt'],
   },
   cache: {
     ttl: 600, // 10 minutes for user data
@@ -134,75 +150,71 @@ export const getUserById = createHandler({
   handler: async ({ resource }) => {
     return resource;
   },
-});
+}));
 
 /**
- * Example: PUT /api/users/[id] - Update user
+ * PUT /api/users/:id - Update user
  */
-export const updateUser = createAuthenticatedHandler({
+router.put('/:id', createAuthenticatedHandler({
   schema: UpdateUserSchema,
   requireOwnership: {
-    table: 'users',
+    model: 'User',
     resourceIdParam: 'id',
-    selectColumns: 'id, name, email, role',
+    selectFields: ['id', 'name', 'email', 'role'],
   },
-  handler: async ({ input, supabase, params, user }) => {
+  handler: async ({ input, prisma, params, user }) => {
     const userId = params.id;
 
     // Users can update themselves, admins can update anyone
-    const canUpdate = user.id === userId || user.role === 'admin';
+    const canUpdate = user?.id === userId || user?.role === 'ADMIN';
     if (!canUpdate) {
       throw new Error('Insufficient permissions');
     }
 
-    const { data, error } = await supabase
-      .from('users')
-      .update({
-        ...input,
-        updated_at: new Date().toISOString(),
-        updated_by: user.id,
-      })
-      .eq('id', userId)
-      .select()
-      .single();
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: input,
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        updatedAt: true,
+      },
+    });
 
-    if (error) throw error;
-
-    return data;
+    return updatedUser;
   },
-});
+}));
 
 /**
- * Example: DELETE /api/users/[id] - Delete user (admin only)
+ * DELETE /api/users/:id - Delete user (admin only)
  */
-export const deleteUser = createAdminHandler({
+router.delete('/:id', createAdminHandler({
   requireOwnership: {
-    table: 'users',
+    model: 'User',
     resourceIdParam: 'id',
-    selectColumns: 'id, name, email',
+    selectFields: ['id', 'name', 'email'],
   },
-  handler: async ({ supabase, params }) => {
+  handler: async ({ prisma, params }) => {
     const userId = params.id;
 
-    const { error } = await supabase
-      .from('users')
-      .delete()
-      .eq('id', userId);
-
-    if (error) throw error;
+    await prisma.user.delete({
+      where: { id: userId },
+    });
 
     return { message: 'User deleted successfully' };
   },
-});
+}));
 
 // ============================================
 // Admin Routes
 // ============================================
 
 /**
- * Example: POST /api/users/bulk - Bulk operations (admin only)
+ * POST /api/users/bulk - Bulk operations (admin only)
  */
-export const bulkCreateUsers = createAdminHandler({
+router.post('/bulk', createAdminHandler({
   schema: z.object({
     users: z.array(CreateUserSchema).min(1).max(100),
   }),
@@ -210,22 +222,23 @@ export const bulkCreateUsers = createAdminHandler({
     windowMs: 300000, // 5 minutes
     maxRequests: 5, // 5 bulk operations per 5 minutes
   },
-  handler: async ({ input, user, supabase }) => {
+  handler: async ({ input, user, prisma }) => {
     const usersToCreate = input.users.map(userData => ({
       ...userData,
-      created_by: user.id,
+      // Note: In real app, hash the password
+      password: 'hashed-password-placeholder',
     }));
 
-    const { data, error } = await supabase
-      .from('users')
-      .insert(usersToCreate)
-      .select();
-
-    if (error) throw error;
+    const createdUsers = await prisma.user.createMany({
+      data: usersToCreate,
+      skipDuplicates: true,
+    });
 
     return {
-      created: data.length,
-      users: data,
+      created: createdUsers.count,
+      message: `${createdUsers.count} users created successfully`,
     };
   },
-});
+}));
+
+export default router;

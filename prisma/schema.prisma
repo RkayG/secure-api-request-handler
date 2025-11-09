@@ -1,0 +1,131 @@
+// Prisma schema for Secure API Handler Framework
+// This is a sample schema - customize it for your application
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// User Management
+// ============================================
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  password  String
+  role      UserRole @default(USER)
+  tenantId  String?
+
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  tenant     Tenant?      @relation(fields: [tenantId], references: [id])
+  projects   Project[]    @relation("ProjectMembers")
+  ownedProjects Project[] @relation("ProjectOwner")
+
+  @@map("users")
+}
+
+model Tenant {
+  id          String   @id @default(cuid())
+  name        String
+  domain      String?  @unique
+  config      Json     @default("{}")
+  isActive    Boolean  @default(true)
+
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  users       User[]
+  projects    Project[]
+
+  @@map("tenants")
+}
+
+// ============================================
+// Project Management
+// ============================================
+
+model Project {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  status      ProjectStatus @default(PLANNING)
+  priority    Priority @default(MEDIUM)
+  tags        String[] @default([])
+  tenantId    String?
+  ownerId     String
+
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  tenant      Tenant?         @relation(fields: [tenantId], references: [id])
+  owner       User            @relation("ProjectOwner", fields: [ownerId], references: [id])
+  members     User[]          @relation("ProjectMembers")
+  tasks       Task[]
+
+  @@map("projects")
+}
+
+model Task {
+  id          String   @id @default(cuid())
+  title       String
+  description String?
+  status      TaskStatus @default(TODO)
+  priority    Priority @default(MEDIUM)
+  projectId   String
+  assigneeId  String?
+
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  project     Project   @relation(fields: [projectId], references: [id])
+  assignee    User?     @relation(fields: [assigneeId], references: [id])
+
+  @@map("tasks")
+}
+
+// ============================================
+// Enums
+// ============================================
+
+enum UserRole {
+  USER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  COMPLETED
+  ARCHIVED
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  REVIEW
+  DONE
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
